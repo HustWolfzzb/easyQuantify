@@ -1,5 +1,5 @@
 import sys
-sys.path.append('../../Quantify')
+sys.path.append('../../easyQuantify')
 import pandas as pd
 from DataEngine.Data import pro
 import jieba
@@ -7,7 +7,7 @@ import datetime
 import time
 import os
 def get_CFSD():
-    pos_neg_word = pd.read_excel('../../Quantify/Sentiment analysis/Li_CFSD_list.xlsx')
+    pos_neg_word = pd.read_excel('../../easyQuantify/Sentiment analysis/Li_CFSD_list.xlsx')
     pos_word = []
     neg_word = []
     for x in range(len(pos_neg_word)):

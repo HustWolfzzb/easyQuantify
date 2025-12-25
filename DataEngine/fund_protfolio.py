@@ -111,4 +111,5 @@ if __name__ == "__main__":
         print(df)
         print(f'{date} 的持仓信息获取成功')
     # 保存 excel 文件
-
+    else:
+        print(f'{code} 没有公开持仓信息', public_dates)

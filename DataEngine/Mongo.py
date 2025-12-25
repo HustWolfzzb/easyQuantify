@@ -72,7 +72,7 @@ $where(自定义筛选条件，效率比较低，需要将bson转为js对象，�
 
 import time
 import sys
-sys.path.append('../../Quantify')
+sys.path.append('../../easyQuantify')
 from DataEngine.Data import get_stock_list_date, pro
 from Config.Config import Config
 config = Config('mongo').getInfo()

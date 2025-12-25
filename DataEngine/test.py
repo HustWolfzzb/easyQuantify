@@ -569,11 +569,11 @@ def multi_process():
 
 
 if __name__ == '__main__':
-    time_start = time.clock()
+    time_start = time.time()
     all_l = multi_process()
     print("MAX :%s"%max(all_l.keys()))
     print(all_l[max(all_l.keys())])
     # symbol = {}
     # test_WUGUI1(data, 0.03, 0.01, 500, 10000, symbol)
     # print(symbol)
-    print("Time usage:%s"%(time.clock() - time_start))
+    print("Time usage:%s"%(time.time() - time_start))
