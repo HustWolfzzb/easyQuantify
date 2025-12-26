@@ -29,7 +29,7 @@ if _project_root not in sys.path:
 # 延迟导入 VLMImageAnalyzer（避免初始化时失败）
 VLM_AVAILABLE = False
 try:
-    from Trade.VLMImageAnalyzer import VLMImageAnalyzer
+    from LLM.VLMImageAnalyzer import VLMImageAnalyzer
     VLM_AVAILABLE = True
 except ImportError:
     VLM_AVAILABLE = False
