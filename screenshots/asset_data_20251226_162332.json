@@ -1,0 +1,28 @@
+{
+  "total_assets": "1226.95",
+  "available_cash": "596.71",
+  "market_value": "630.24",
+  "frozen_amount": "-583.65",
+  "stocks": [
+    {
+      "code": "605337",
+      "name": "李子园",
+      "quantity": "52",
+      "cost_price": "182.396",
+      "current_price": "12.120",
+      "market_value": "630.240",
+      "profit_loss": "-8854.370",
+      "profit_loss_rate": "-93.355%"
+    },
+    {
+      "code": "600481",
+      "name": "双良节能",
+      "quantity": "0",
+      "cost_price": "0.000",
+      "current_price": "5.830",
+      "market_value": "0.000",
+      "profit_loss": "-2631.280",
+      "profit_loss_rate": "0.000%"
+    }
+  ]
+}

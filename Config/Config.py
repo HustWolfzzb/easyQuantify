@@ -78,3 +78,5 @@ class Config():
             return self.data['Tushare']
         if self.type.find('Neo4j') != -1 or self.type.find('neo4j') != -1:
             return self.data['Neo4j']
+        if self.type.find('DashScope')!=-1 or self.type.find('dashscope')!=-1 or self.type.find('dash')!=-1 or self.type.find('vl')!=-1 or self.type.find('VLM')!=-1:
+            return self.data['DashScope']
