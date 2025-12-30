@@ -9,8 +9,10 @@ import time
 import subprocess
 import io
 import json
+import logging
+import glob
 from typing import Dict, Tuple, Optional, List, Any
-from datetime import datetime
+from datetime import datetime, time as dt_time, timezone, timedelta
 import win32gui
 import win32con
 import win32process
@@ -33,61 +35,165 @@ try:
     VLM_AVAILABLE = True
 except ImportError:
     VLM_AVAILABLE = False
+    # 此时logger还未初始化，使用print
     print("警告: VLMImageAnalyzer 未安装，F4 查询功能将无法使用 VLM 分析")
 
-# OCR 库检测（延迟导入，避免导入时失败）
-OCR_TYPE = None
-OCR_AVAILABLE = False
 
-def _check_ocr_availability():
-    """检查可用的 OCR 库（延迟检查，避免导入时失败）"""
-    global OCR_TYPE, OCR_AVAILABLE
+class SystemLogger:
+    """
+    系统日志管理器
+    管理截图、资产JSON等文件，并提供定期清理功能
+    """
     
-    if OCR_AVAILABLE:
-        return OCR_TYPE
+    def __init__(self, base_dir: str = "SystemLog", retention_days: int = 7):
+        """
+        初始化日志管理器
+        
+        Args:
+            base_dir: 日志根目录，默认为 "SystemLog"
+            retention_days: 文件保留天数，默认7天
+        """
+        # @FIX 新增了日志系统，还胡自动清理。
+        self.base_dir = base_dir
+        self.retention_days = retention_days
+        
+        # 创建子目录
+        self.screenshots_dir = os.path.join(base_dir, "screenshots")
+        self.assets_dir = os.path.join(base_dir, "assets")
+        self.logs_dir = os.path.join(base_dir, "logs")
+        
+        # 创建目录
+        for dir_path in [self.screenshots_dir, self.assets_dir, self.logs_dir]:
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+        
+        # 初始化日志记录器
+        self.logger = self._init_logger()
+        
+        # 执行清理（如果距离上次清理超过一天，则清理）
+        self._cleanup_if_needed()
     
-    # 优先尝试 easyocr
-    try:
-        import easyocr
-        OCR_TYPE = 'easyocr'
-        OCR_AVAILABLE = True
-        return 'easyocr'
-    except (ImportError, OSError, Exception) as e:
-        # OSError 可能包含 DLL 加载错误
-        pass
+    def _init_logger(self) -> logging.Logger:
+        """初始化Python logging"""
+        logger = logging.getLogger("TongHuaShunExecutor")
+        logger.setLevel(logging.INFO)
+        
+        # 避免重复添加handler
+        if logger.handlers:
+            return logger
+        
+        # 文件handler
+        log_file = os.path.join(self.logs_dir, f"executor_{datetime.now().strftime('%Y%m%d')}.log")
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+        
+        # 控制台handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+        
+        return logger
     
-    # 尝试 pytesseract (Tesseract OCR，更轻量级)
-    try:
-        import pytesseract
-        from PIL import Image
-        OCR_TYPE = 'pytesseract'
-        OCR_AVAILABLE = True
-        return 'pytesseract'
-    except ImportError:
-        pass
+    def _get_last_cleanup_time(self) -> Optional[datetime]:
+        """获取上次清理时间"""
+        cleanup_file = os.path.join(self.base_dir, ".last_cleanup")
+        if os.path.exists(cleanup_file):
+            try:
+                with open(cleanup_file, 'r') as f:
+                    timestamp_str = f.read().strip()
+                    return datetime.fromisoformat(timestamp_str)
+            except:
+                return None
+        return None
     
-    # 尝试百度 OCR
-    try:
-        from aip import AipOcr
-        OCR_TYPE = 'baidu'
-        OCR_AVAILABLE = True
-        return 'baidu'
-    except ImportError:
-        pass
+    def _save_cleanup_time(self):
+        """保存清理时间"""
+        cleanup_file = os.path.join(self.base_dir, ".last_cleanup")
+        try:
+            with open(cleanup_file, 'w') as f:
+                f.write(datetime.now().isoformat())
+        except:
+            pass
     
-    OCR_AVAILABLE = False
-    return None
-
-# 初始化时检查 OCR 可用性
-_check_ocr_availability()
-if OCR_TYPE:
-    print(f"检测到 OCR 库: {OCR_TYPE}")
-else:
-    print("警告: 未安装 OCR 库，将使用基础图像识别")
-    print("建议安装以下之一:")
-    print("  1. pip install pytesseract  (需要先安装 Tesseract OCR)")
-    print("  2. pip install easyocr  (需要 PyTorch，可能遇到 DLL 问题)")
-    print("  3. pip install baidu-aip  (需要百度 API 密钥)")
+    def _cleanup_if_needed(self):
+        """如果需要，执行清理操作（每天最多清理一次）"""
+        last_cleanup = self._get_last_cleanup_time()
+        now = datetime.now()
+        
+        # 如果从未清理过，或者距离上次清理超过1天，则清理
+        if last_cleanup is None or (now - last_cleanup).days >= 1:
+            self.cleanup_old_files()
+            self._save_cleanup_time()
+    
+    def cleanup_old_files(self):
+        """清理过期文件"""
+        cutoff_time = datetime.now() - timedelta(days=self.retention_days)
+        deleted_count = 0
+        
+        # 清理截图文件
+        for pattern in [os.path.join(self.screenshots_dir, "*.png"),
+                       os.path.join(self.screenshots_dir, "*.jpg"),
+                       os.path.join(self.assets_dir, "*.json")]:
+            for file_path in glob.glob(pattern):
+                try:
+                    file_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                    if file_time < cutoff_time:
+                        os.remove(file_path)
+                        deleted_count += 1
+                except Exception as e:
+                    self.logger.warning(f"清理文件失败 {file_path}: {e}")
+        
+        if deleted_count > 0:
+            self.logger.info(f"清理完成，删除了 {deleted_count} 个过期文件（超过{self.retention_days}天）")
+        else:
+            self.logger.debug("无需清理，没有过期文件")
+    
+    def get_screenshot_path(self, filename: Optional[str] = None) -> str:
+        """获取截图保存路径"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"screenshot_{timestamp}.png"
+        return os.path.join(self.screenshots_dir, filename)
+    
+    def get_asset_path(self, filename: Optional[str] = None) -> str:
+        """获取资产JSON保存路径"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"asset_data_{timestamp}.json"
+        return os.path.join(self.assets_dir, filename)
+    
+    def save_asset_data(self, asset_data: Dict[str, Any], filename: Optional[str] = None) -> str:
+        """保存资产数据到JSON文件"""
+        file_path = self.get_asset_path(filename)
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(asset_data, f, ensure_ascii=False, indent=2)
+            self.logger.info(f"资产数据已保存: {file_path}")
+            return file_path
+        except Exception as e:
+            self.logger.error(f"保存资产数据失败: {e}")
+            raise
+    
+    def info(self, message: str):
+        """记录信息日志"""
+        self.logger.info(message)
+    
+    def warning(self, message: str):
+        """记录警告日志"""
+        self.logger.warning(message)
+    
+    def error(self, message: str):
+        """记录错误日志"""
+        self.logger.error(message)
+    
+    def debug(self, message: str):
+        """记录调试日志"""
+        self.logger.debug(message)
 
 
 class TongHuaShunExecutor:
@@ -96,24 +202,26 @@ class TongHuaShunExecutor:
     通过 Windows 窗口操作和图像识别来控制 xiadan.exe 程序
     """
     
-    def __init__(self, exe_path: str, screenshot_dir: str = "screenshots", 
-                 ocr_app_id: Optional[str] = None, 
-                 ocr_api_key: Optional[str] = None, 
-                 ocr_secret_key: Optional[str] = None):
+    def __init__(self, exe_path: str, screenshot_dir: str = None, log_dir: str = "SystemLog"):
         """
         初始化执行器
         
         Args:
             exe_path: xiadan.exe 程序的完整路径
-            screenshot_dir: 截图保存目录
-            ocr_app_id: 百度 OCR App ID（可选）
-            ocr_api_key: 百度 OCR API Key（可选）
-            ocr_secret_key: 百度 OCR Secret Key（可选）
+            screenshot_dir: 截图保存目录（已废弃，保留用于兼容性，实际使用SystemLog/screenshots）
+            log_dir: 日志根目录，默认为 "SystemLog"
         """
         self.exe_path = exe_path
-        self.screenshot_dir = screenshot_dir
         self.hwnd = None  # 窗口句柄
         self.window_rect = None  # 窗口坐标 (left, top, right, bottom)
+        
+        # 初始化日志管理器
+        self.logger = SystemLogger(base_dir=log_dir, retention_days=7)
+        self.screenshot_dir = self.logger.screenshots_dir  # 使用logger管理的目录
+        
+        # 如果旧截图目录存在且与新目录不同，提示用户
+        if screenshot_dir and screenshot_dir != self.screenshot_dir and os.path.exists(screenshot_dir):
+            self.logger.warning(f"检测到旧截图目录 '{screenshot_dir}'，新截图将保存到 '{self.screenshot_dir}'")
         
         # 股票名称到代码的转换字典（可维护）
         self.stock_name_to_code = {
@@ -126,56 +234,10 @@ class TongHuaShunExecutor:
         if VLM_AVAILABLE:
             try:
                 self.vlm_analyzer = VLMImageAnalyzer()
-                print("VLM 分析器初始化成功")
+                self.logger.info("VLM 分析器初始化成功")
             except Exception as e:
-                print(f"VLM 分析器初始化失败: {e}")
+                self.logger.warning(f"VLM 分析器初始化失败: {e}")
                 self.vlm_analyzer = None
-        
-        # 创建截图目录
-        if not os.path.exists(screenshot_dir):
-            os.makedirs(screenshot_dir)
-        
-        # 初始化 OCR（延迟初始化，避免导入时失败）
-        self.ocr_client = None
-        self.ocr_type = _check_ocr_availability()
-        
-        if self.ocr_type == 'easyocr':
-            try:
-                import easyocr
-                # easyocr 支持中文和英文
-                print("正在初始化本地 OCR (easyocr)，首次运行会下载模型，请稍候...")
-                self.ocr_client = easyocr.Reader(['ch_sim', 'en'], gpu=False)  # 中文简体和英文
-                print("本地 OCR 初始化成功")
-            except Exception as e:
-                print(f"本地 OCR 初始化失败: {e}")
-                print("提示: 如果遇到 DLL 错误，可以尝试:")
-                print("  1. 安装 Visual C++ Redistributable")
-                print("  2. 重新安装 PyTorch: pip install torch --index-url https://download.pytorch.org/whl/cu118")
-                print("  3. 或使用 pytesseract 作为替代方案")
-                self.ocr_client = None
-                self.ocr_type = None
-        elif self.ocr_type == 'pytesseract':
-            try:
-                import pytesseract
-                self.ocr_client = pytesseract
-                # 设置 Tesseract 路径（如果需要）
-                # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-                print("Tesseract OCR 初始化成功")
-            except Exception as e:
-                print(f"Tesseract OCR 初始化失败: {e}")
-                print("提示: 需要先安装 Tesseract OCR:")
-                print("  下载地址: https://github.com/UB-Mannheim/tesseract/wiki")
-                self.ocr_client = None
-                self.ocr_type = None
-        elif self.ocr_type == 'baidu' and ocr_app_id and ocr_api_key and ocr_secret_key:
-            try:
-                from aip import AipOcr
-                self.ocr_client = AipOcr(ocr_app_id, ocr_api_key, ocr_secret_key)
-                print("百度 OCR 初始化成功")
-            except Exception as e:
-                print(f"百度 OCR 初始化失败: {e}")
-                self.ocr_client = None
-                self.ocr_type = None
         
         # 界面元素识别结果缓存
         self.ui_elements = {}  # {元素名称: (中心坐标, 类型)}
@@ -211,7 +273,8 @@ class TongHuaShunExecutor:
         win32gui.EnumWindows(callback, windows)
         
         if windows:
-            # 打印所有找到的窗口信息
+            # 打印所有找到的窗口信息（调试信息）
+            # 注意：此时logger可能还未初始化，使用print
             print(f"找到 {len(windows)} 个可能的窗口:")
             for i, (hwnd, title, cls, exe) in enumerate(windows):
                 rect = win32gui.GetWindowRect(hwnd)
@@ -252,35 +315,44 @@ class TongHuaShunExecutor:
             return windows[0]
         return None
     
-    def get_window_rect(self, hwnd: int) -> Tuple[int, int, int, int]:
+    def get_window_rect(self, hwnd: int, use_client_area: bool = False) -> Tuple[int, int, int, int]:
         """
-        获取窗口坐标（客户区，不包括标题栏和边框）
+        获取窗口坐标
         
         Args:
             hwnd: 窗口句柄
+            use_client_area: 是否使用客户区（不包括标题栏和边框），默认 False 使用整个窗口
             
         Returns:
-            (left, top, right, bottom) 窗口客户区坐标（屏幕坐标）
+            (left, top, right, bottom) 窗口坐标（屏幕坐标）
         """
         try:
             # 检查窗口是否有效
             if not win32gui.IsWindow(hwnd):
                 raise ValueError("窗口句柄无效")
             
-            # 获取客户区矩形（相对于窗口）
-            # GetClientRect 返回 (left, top, right, bottom)，其中 left 和 top 通常是 0
-            client_rect = win32gui.GetClientRect(hwnd)
-            client_left, client_top, client_right, client_bottom = client_rect
-            
-            # 将客户区左上角坐标转换为屏幕坐标
-            screen_left, screen_top = win32gui.ClientToScreen(hwnd, (client_left, client_top))
-            
-            # 将客户区右下角坐标转换为屏幕坐标
-            screen_right, screen_bottom = win32gui.ClientToScreen(hwnd, (client_right, client_bottom))
-            
-            return (screen_left, screen_top, screen_right, screen_bottom)
+            if use_client_area:
+                # 获取客户区矩形（不包括标题栏和边框）
+                client_rect = win32gui.GetClientRect(hwnd)
+                client_left, client_top, client_right, client_bottom = client_rect
+                
+                # 将客户区左上角坐标转换为屏幕坐标
+                screen_left, screen_top = win32gui.ClientToScreen(hwnd, (client_left, client_top))
+                
+                # 将客户区右下角坐标转换为屏幕坐标
+                screen_right, screen_bottom = win32gui.ClientToScreen(hwnd, (client_right, client_bottom))
+                
+                return (screen_left, screen_top, screen_right, screen_bottom)
+            else:
+                # 使用整个窗口矩形（包含标题栏和边框）
+                rect = win32gui.GetWindowRect(hwnd)
+                return rect
         except Exception as e:
-            print(f"获取窗口坐标失败: {e}")
+            # 注意：此时可能logger还未初始化，需要检查
+            if hasattr(self, 'logger'):
+                self.logger.error(f"获取窗口坐标失败: {e}")
+            else:
+                print(f"获取窗口坐标失败: {e}")
             # 如果失败，尝试使用 GetWindowRect（包含标题栏）
             try:
                 rect = win32gui.GetWindowRect(hwnd)
@@ -301,7 +373,10 @@ class TongHuaShunExecutor:
         try:
             # 检查窗口是否有效
             if not win32gui.IsWindow(hwnd):
-                print("窗口句柄无效")
+                if hasattr(self, 'logger'):
+                    self.logger.error("窗口句柄无效")
+                else:
+                    print("窗口句柄无效")
                 return False
             
             # 检查窗口是否最小化
@@ -356,7 +431,10 @@ class TongHuaShunExecutor:
             
             return True
         except Exception as e:
-            print(f"聚焦窗口时出错: {e}")
+            if hasattr(self, 'logger'):
+                self.logger.error(f"聚焦窗口时出错: {e}")
+            else:
+                print(f"聚焦窗口时出错: {e}")
             return False
     
     def launch_program(self) -> bool:
@@ -367,7 +445,7 @@ class TongHuaShunExecutor:
             是否成功启动
         """
         if not os.path.exists(self.exe_path):
-            print(f"程序路径不存在: {self.exe_path}")
+            self.logger.error(f"程序路径不存在: {self.exe_path}")
             return False
         
         try:
@@ -393,18 +471,18 @@ class TongHuaShunExecutor:
                 left, top, right, bottom = self.window_rect
                 width = right - left
                 height = bottom - top
-                print(f"程序启动成功")
-                print(f"  窗口句柄: {self.hwnd}")
-                print(f"  窗口标题: '{window_title}'")
-                print(f"  窗口类名: '{window_class}'")
-                print(f"  客户区坐标: {self.window_rect}")
-                print(f"  客户区尺寸: {width}x{height}")
+                self.logger.info(f"程序启动成功")
+                self.logger.info(f"  窗口句柄: {self.hwnd}")
+                self.logger.info(f"  窗口标题: '{window_title}'")
+                self.logger.info(f"  窗口类名: '{window_class}'")
+                self.logger.info(f"  客户区坐标: {self.window_rect}")
+                self.logger.info(f"  客户区尺寸: {width}x{height}")
                 return True
             else:
-                print("无法找到程序窗口")
+                self.logger.error("无法找到程序窗口")
                 return False
         except Exception as e:
-            print(f"启动程序失败: {e}")
+            self.logger.error(f"启动程序失败: {e}")
             return False
     
     def activate_window(self) -> bool:
@@ -432,15 +510,15 @@ class TongHuaShunExecutor:
                 left, top, right, bottom = self.window_rect
                 width = right - left
                 height = bottom - top
-                print(f"窗口激活成功")
-                print(f"  窗口句柄: {self.hwnd}")
-                print(f"  窗口标题: '{window_title}'")
-                print(f"  窗口类名: '{window_class}'")
-                print(f"  客户区坐标: {self.window_rect}")
-                print(f"  客户区尺寸: {width}x{height}")
+                self.logger.info(f"窗口激活成功")
+                self.logger.info(f"  窗口句柄: {self.hwnd}")
+                self.logger.info(f"  窗口标题: '{window_title}'")
+                self.logger.info(f"  窗口类名: '{window_class}'")
+                self.logger.info(f"  客户区坐标: {self.window_rect}")
+                self.logger.info(f"  客户区尺寸: {width}x{height}")
                 return True
         
-        print("无法找到程序窗口，请先启动程序")
+        self.logger.error("无法找到程序窗口，请先启动程序")
         return False
     
     def capture_window(self, save_path: Optional[str] = None) -> Optional[Image.Image]:
@@ -454,47 +532,41 @@ class TongHuaShunExecutor:
             PIL Image 对象，失败返回 None
         """
         if not self.hwnd or not self.window_rect:
-            print("窗口未激活，请先启动或激活程序")
+            self.logger.error("窗口未激活，请先启动或激活程序")
             return None
         
         try:
             # 聚焦窗口，确保窗口在前台
             if not self.focus_window(self.hwnd):
-                print("无法聚焦窗口，尝试继续...")
+                self.logger.warning("无法聚焦窗口，尝试继续...")
             
             time.sleep(0.2)  # 等待窗口完全显示
             
             # 重新获取窗口坐标（窗口可能移动了）
-            self.window_rect = self.get_window_rect(self.hwnd)
+            # 使用整个窗口矩形，确保截取完整窗口
+            self.window_rect = self.get_window_rect(self.hwnd, use_client_area=False)
             left, top, right, bottom = self.window_rect
             width = right - left
             height = bottom - top
             
+            self.logger.debug(f"窗口坐标: ({left}, {top}, {right}, {bottom})")
+            self.logger.debug(f"窗口尺寸: {width}x{height}")
+            
             # 验证窗口尺寸和坐标是否合理
             if width <= 0 or height <= 0:
-                print(f"错误: 窗口尺寸无效 ({width}x{height})")
-                print(f"坐标: left={left}, top={top}, right={right}, bottom={bottom}")
-                # 尝试使用窗口矩形而不是客户区
-                try:
-                    rect = win32gui.GetWindowRect(self.hwnd)
-                    left, top, right, bottom = rect
-                    width = right - left
-                    height = bottom - top
-                    print(f"使用窗口矩形: {width}x{height}")
-                    self.window_rect = rect
-                except Exception as e:
-                    print(f"获取窗口矩形也失败: {e}")
-                    return None
+                self.logger.error(f"窗口尺寸无效 ({width}x{height})")
+                self.logger.error(f"坐标: left={left}, top={top}, right={right}, bottom={bottom}")
+                return None
             
             if width < 50 or height < 50:
-                print(f"警告: 窗口尺寸异常 ({width}x{height})，可能是错误的窗口")
+                self.logger.warning(f"窗口尺寸异常 ({width}x{height})，可能是错误的窗口")
                 window_title = win32gui.GetWindowText(self.hwnd)
-                print(f"当前窗口标题: '{window_title}'")
+                self.logger.warning(f"当前窗口标题: '{window_title}'")
                 # 即使尺寸异常，也尝试截图
             
             # 确保坐标有效（right > left, bottom > top）
             if right <= left or bottom <= top:
-                print(f"错误: 坐标无效 - left={left}, top={top}, right={right}, bottom={bottom}")
+                self.logger.error(f"坐标无效 - left={left}, top={top}, right={right}, bottom={bottom}")
                 return None
             
             # 再次确保窗口在前台（截图前）
@@ -515,426 +587,16 @@ class TongHuaShunExecutor:
             
             # 保存截图
             if save_path is None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = os.path.join(self.screenshot_dir, f"screenshot_{timestamp}.png")
+                save_path = self.logger.get_screenshot_path()
             
             screenshot.save(save_path)
-            print(f"截图已保存: {save_path}")
+            self.logger.info(f"截图已保存: {save_path}")
             
             return screenshot
         except Exception as e:
-            print(f"截图失败: {e}")
+            self.logger.error(f"截图失败: {e}")
             return None
-    
-    def _ocr_recognize(self, image: Image.Image) -> List[Dict]:
-        """
-        使用 OCR 识别图像中的文字
-        
-        Args:
-            image: PIL Image 对象
-            
-        Returns:
-            OCR 识别结果列表，格式统一为: [{'words': '文字', 'location': {'left': x, 'top': y, 'width': w, 'height': h}}, ...]
-        """
-        if not self.ocr_client or not self.ocr_type:
-            return []
-        
-        try:
-            if self.ocr_type == 'easyocr':
-                # 使用 easyocr
-                # 转换为 numpy 数组
-                img_array = np.array(image)
-                # easyocr 需要 BGR 格式
-                if len(img_array.shape) == 3:
-                    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                else:
-                    img_bgr = img_array
-                
-                # 调用 OCR
-                results = self.ocr_client.readtext(img_bgr)
-                
-                # 转换为统一格式
-                ocr_results = []
-                for result in results:
-                    # result 格式: (bbox, text, confidence)
-                    # bbox 格式: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
-                    bbox = result[0]
-                    text = result[1]
-                    confidence = result[2]
-                    
-                    # 计算边界框
-                    xs = [point[0] for point in bbox]
-                    ys = [point[1] for point in bbox]
-                    left = int(min(xs))
-                    top = int(min(ys))
-                    right = int(max(xs))
-                    bottom = int(max(ys))
-                    width = right - left
-                    height = bottom - top
-                    
-                    # 只保留置信度较高的结果
-                    if confidence > 0.3:  # 可以调整阈值
-                        ocr_results.append({
-                            'words': text,
-                            'location': {
-                                'left': left,
-                                'top': top,
-                                'width': width,
-                                'height': height
-                            },
-                            'confidence': confidence
-                        })
-                
-                return ocr_results
-                
-            elif self.ocr_type == 'pytesseract':
-                # 使用 pytesseract (Tesseract OCR)
-                # 配置：支持中文和英文
-                import pytesseract
-                
-                # 使用 image_to_data 获取带位置信息的识别结果
-                # lang='chi_sim+eng' 表示中文简体和英文
-                try:
-                    data = pytesseract.image_to_data(image, lang='chi_sim+eng', output_type=pytesseract.Output.DICT)
-                except:
-                    # 如果中文语言包未安装，只使用英文
-                    data = pytesseract.image_to_data(image, lang='eng', output_type=pytesseract.Output.DICT)
-                
-                ocr_results = []
-                n_boxes = len(data['text'])
-                
-                for i in range(n_boxes):
-                    text = data['text'][i].strip()
-                    conf = int(data['conf'][i])
-                    
-                    # 过滤空文本和低置信度结果
-                    if text and conf > 30:  # 置信度阈值
-                        left = data['left'][i]
-                        top = data['top'][i]
-                        width = data['width'][i]
-                        height = data['height'][i]
-                        
-                        ocr_results.append({
-                            'words': text,
-                            'location': {
-                                'left': left,
-                                'top': top,
-                                'width': width,
-                                'height': height
-                            },
-                            'confidence': conf / 100.0  # 转换为 0-1 范围
-                        })
-                
-                return ocr_results
-                
-            elif self.ocr_type == 'baidu':
-                # 使用百度 OCR
-                # 将图像转换为字节
-                img_bytes = io.BytesIO()
-                image.save(img_bytes, format='PNG')
-                img_bytes = img_bytes.getvalue()
-                
-                # 调用 OCR
-                options = {"recognize_granularity": "small"}
-                result = self.ocr_client.general(img_bytes, options)
-                
-                if 'words_result' in result:
-                    return result['words_result']
-        except Exception as e:
-            print(f"OCR 识别失败: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        return []
-    
-    def detect_buttons(self, image: Image.Image) -> Dict[str, Tuple[int, int]]:
-        """
-        识别图像中的按钮并返回中心坐标
-        
-        Args:
-            image: PIL Image 对象
-            
-        Returns:
-            字典，格式为 {按钮名称: (中心x, 中心y)}
-        """
-        # 转换为 OpenCV 格式
-        img_array = np.array(image)
-        img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        img_gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-        
-        buttons = {}
-        
-        # 获取图像尺寸
-        img_height, img_width = img_gray.shape
-        print(f"图像尺寸: {img_width}x{img_height}")
-        
-        # 方法1: 使用轮廓检测识别按钮（矩形区域）
-        # 二值化
-        _, binary = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # 查找轮廓
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        print(f"找到 {len(contours)} 个轮廓")
-        
-        # 获取 OCR 识别结果（用于识别按钮文字）
-        ocr_results = self._ocr_recognize(image) if self.ocr_client else []
-        if ocr_results:
-            print(f"OCR 识别到 {len(ocr_results)} 个文字区域")
-        
-        # 过滤出可能是按钮的矩形区域
-        button_index = 1
-        min_area = max(100, img_width * img_height * 0.001)  # 动态调整最小面积
-        print(f"按钮识别参数: 最小面积={min_area:.0f}, 最小高度=15")
-        
-        for i, contour in enumerate(contours):
-            area = cv2.contourArea(contour)
-            # 过滤太小的区域
-            if area < min_area:
-                continue
-            
-            # 获取边界矩形
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = w / float(h) if h > 0 else 0
-            
-            # 按钮通常是横向或接近正方形的矩形，放宽条件
-            if 0.3 < aspect_ratio < 5.0 and h > 15 and w > 20:  # 放宽条件
-                center_x = x + w // 2
-                center_y = y + h // 2
-                
-                # 尝试通过 OCR 识别按钮文字
-                button_name = None
-                if ocr_results:
-                    for ocr_item in ocr_results:
-                        if 'location' in ocr_item:
-                            loc = ocr_item['location']
-                            # 检查 OCR 文字是否在按钮区域内
-                            ocr_left = loc.get('left', 0)
-                            ocr_top = loc.get('top', 0)
-                            ocr_width = loc.get('width', 0)
-                            ocr_height = loc.get('height', 0)
-                            
-                            # 判断 OCR 文字中心是否在按钮区域内
-                            ocr_center_x = ocr_left + ocr_width // 2
-                            ocr_center_y = ocr_top + ocr_height // 2
-                            
-                            if (x <= ocr_center_x <= x + w and 
-                                y <= ocr_center_y <= y + h):
-                                button_name = ocr_item.get('words', '').strip()
-                                if button_name:
-                                    break
-                
-                # 如果没有识别到文字，使用默认名称
-                if not button_name:
-                    button_name = f"按钮_{button_index}"
-                    button_index += 1
-                
-                buttons[button_name] = (center_x, center_y)
-                print(f"检测到按钮: {button_name} 中心坐标: ({center_x}, {center_y}), 尺寸: {w}x{h}, 面积: {area:.0f}")
-        
-        return buttons
-    
-    def detect_input_boxes(self, image: Image.Image) -> Dict[str, Tuple[int, int]]:
-        """
-        识别图像中的输入框并返回中心坐标
-        
-        Args:
-            image: PIL Image 对象
-            
-        Returns:
-            字典，格式为 {输入框名称: (中心x, 中心y)}
-        """
-        # 转换为 OpenCV 格式
-        img_array = np.array(image)
-        img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        img_gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-        
-        input_boxes = {}
-        
-        # 获取图像尺寸
-        img_height, img_width = img_gray.shape
-        
-        # 方法1: 使用边缘检测识别输入框
-        edges = cv2.Canny(img_gray, 50, 150)
-        
-        # 查找轮廓
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        print(f"输入框检测: 找到 {len(contours)} 个边缘轮廓")
-        
-        # 获取 OCR 识别结果（用于识别输入框标签）
-        ocr_results = self._ocr_recognize(image) if self.ocr_client else []
-        if ocr_results:
-            print(f"输入框 OCR 识别到 {len(ocr_results)} 个文字区域")
-            # 打印所有识别到的文字（用于调试）
-            for ocr_item in ocr_results:
-                words = ocr_item.get('words', '').strip()
-                if words:
-                    loc = ocr_item.get('location', {})
-                    print(f"  OCR文字: '{words}' 位置: ({loc.get('left', 0)}, {loc.get('top', 0)})")
-        
-        # 过滤出可能是输入框的矩形区域
-        input_index = 1
-        min_area = max(50, img_width * img_height * 0.0005)  # 动态调整最小面积
-        print(f"输入框识别参数: 最小面积={min_area:.0f}, 高度范围=10-60")
-        
-        for i, contour in enumerate(contours):
-            area = cv2.contourArea(contour)
-            # 过滤太小的区域
-            if area < min_area:
-                continue
-            
-            # 获取边界矩形
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = w / float(h) if h > 0 else 0
-            
-            # 输入框通常是横向的矩形，放宽条件
-            if aspect_ratio > 1.5 and h > 10 and h < 60 and w > 30:  # 放宽条件
-                center_x = x + w // 2
-                center_y = y + h // 2
-                
-                # 尝试通过 OCR 识别输入框标签（通常在输入框左侧或上方）
-                input_name = None
-                best_match = None
-                min_distance = float('inf')
-                
-                if ocr_results:
-                    # 查找输入框附近的文字标签
-                    for ocr_item in ocr_results:
-                        if 'location' in ocr_item:
-                            loc = ocr_item['location']
-                            ocr_left = loc.get('left', 0)
-                            ocr_top = loc.get('top', 0)
-                            ocr_width = loc.get('width', 0)
-                            ocr_height = loc.get('height', 0)
-                            ocr_right = ocr_left + ocr_width
-                            ocr_bottom = ocr_top + ocr_height
-                            
-                            # 计算文字中心
-                            ocr_center_x = ocr_left + ocr_width // 2
-                            ocr_center_y = ocr_top + ocr_height // 2
-                            
-                            words = ocr_item.get('words', '').strip()
-                            if not words:
-                                continue
-                            
-                            # 检查文字是否在输入框附近（左侧、上方或内部）
-                            # 左侧：文字在输入框左侧，且垂直对齐
-                            is_left = (ocr_right < x + 50 and 
-                                      abs(ocr_center_y - center_y) < h + 15)
-                            
-                            # 上方：文字在输入框上方，且水平对齐
-                            is_above = (ocr_bottom < y + 20 and 
-                                       abs(ocr_center_x - center_x) < w + 20)
-                            
-                            # 内部：文字在输入框内部（可能是占位符）
-                            is_inside = (x <= ocr_center_x <= x + w and 
-                                        y <= ocr_center_y <= y + h)
-                            
-                            if is_left or is_above:
-                                # 计算距离，选择最近的标签
-                                distance = ((ocr_center_x - center_x) ** 2 + 
-                                          (ocr_center_y - center_y) ** 2) ** 0.5
-                                
-                                if distance < min_distance:
-                                    min_distance = distance
-                                    best_match = words
-                            
-                            # 如果是内部文字且看起来像标签（短文本，可能是占位符）
-                            elif is_inside and len(words) < 10:
-                                # 检查是否是常见的占位符关键词
-                                placeholder_keywords = ['请输入', '输入', '代码', '价格', '数量']
-                                if any(kw in words for kw in placeholder_keywords):
-                                    best_match = words
-                                    break
-                    
-                    if best_match:
-                        input_name = best_match
-                
-                # 如果没有识别到标签，使用默认名称
-                if not input_name:
-                    input_name = f"输入框_{input_index}"
-                    input_index += 1
-                
-                input_boxes[input_name] = (center_x, center_y)
-                print(f"检测到输入框: {input_name} 中心坐标: ({center_x}, {center_y}), 尺寸: {w}x{h}, 面积: {area:.0f}")
-        
-        return input_boxes
-    
-    def analyze_ui(self, image: Optional[Image.Image] = None) -> Dict[str, Dict[str, Tuple[int, int]]]:
-        """
-        分析界面，识别所有按钮和输入框
-        
-        Args:
-            image: PIL Image 对象，如果为 None 则自动截图
-            
-        Returns:
-            字典，包含 'buttons' 和 'input_boxes' 两个键
-        """
-        if image is None:
-            image = self.capture_window()
-            if image is None:
-                return {'buttons': {}, 'input_boxes': {}}
-        
-        # 识别按钮
-        buttons = self.detect_buttons(image)
-        
-        # 识别输入框
-        input_boxes = self.detect_input_boxes(image)
-        
-        # 更新缓存
-        self.ui_elements = {
-            'buttons': buttons,
-            'input_boxes': input_boxes
-        }
-        
-        return {
-            'buttons': buttons,
-            'input_boxes': input_boxes
-        }
-    
-    def get_element_coordinate(self, element_name: str, element_type: str = 'auto') -> Optional[Tuple[int, int]]:
-        """
-        获取界面元素的坐标（相对于窗口）
-        
-        Args:
-            element_name: 元素名称
-            element_type: 元素类型 ('button', 'input_box', 'auto')
-            
-        Returns:
-            (x, y) 坐标，如果未找到返回 None
-        """
-        if not self.ui_elements:
-            print("界面元素未识别，请先调用 analyze_ui()")
-            return None
-        
-        # 自动判断类型
-        if element_type == 'auto':
-            if element_name in self.ui_elements.get('buttons', {}):
-                element_type = 'button'
-            elif element_name in self.ui_elements.get('input_boxes', {}):
-                element_type = 'input_box'
-            else:
-                print(f"未找到元素: {element_name}")
-                return None
-        
-        # 获取坐标
-        if element_type == 'button':
-            coord = self.ui_elements.get('buttons', {}).get(element_name)
-        elif element_type == 'input_box':
-            coord = self.ui_elements.get('input_boxes', {}).get(element_name)
-        else:
-            print(f"不支持的元素类型: {element_type}")
-            return None
-        
-        if coord:
-            # 转换为屏幕绝对坐标
-            if self.window_rect:
-                screen_x = self.window_rect[0] + coord[0]
-                screen_y = self.window_rect[1] + coord[1]
-                return (screen_x, screen_y)
-            return coord
-        
-        return None
-    
+
     def click_element(self, element_name: str, element_type: str = 'auto') -> bool:
         """
         点击界面元素
@@ -962,10 +624,10 @@ class TongHuaShunExecutor:
             time.sleep(0.05)
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             
-            print(f"已点击元素: {element_name} 坐标: {coord}")
+            self.logger.info(f"已点击元素: {element_name} 坐标: {coord}")
             return True
         except Exception as e:
-            print(f"点击元素失败: {e}")
+            self.logger.error(f"点击元素失败: {e}")
             return False
     
     def input_text(self, element_name: str, text: str) -> bool:
@@ -1011,10 +673,10 @@ class TongHuaShunExecutor:
             win32api.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)  # Ctrl up
             time.sleep(0.1)
             
-            print(f"已在 {element_name} 输入文本: {text}")
+            self.logger.info(f"已在 {element_name} 输入文本: {text}")
             return True
         except Exception as e:
-            print(f"输入文本失败: {e}")
+            self.logger.error(f"输入文本失败: {e}")
             return False
     
     # ==================== 键盘快捷键控制功能 ====================
@@ -1044,7 +706,7 @@ class TongHuaShunExecutor:
             time.sleep(wait_time)
             return True
         except Exception as e:
-            print(f"发送按键失败: {e}")
+            self.logger.error(f"发送按键失败: {e}")
             return False
     
     def _send_backspace(self, times: int = 1, wait_time: float = 0.1) -> bool:
@@ -1072,7 +734,7 @@ class TongHuaShunExecutor:
             time.sleep(0.15)
             return True
         except Exception as e:
-            print(f"发送 Backspace 失败: {e}")
+            self.logger.error(f"发送 Backspace 失败: {e}")
             return False
     
     def _send_enter(self, times: int = 1, wait_time: float = 0.2) -> bool:
@@ -1100,7 +762,7 @@ class TongHuaShunExecutor:
             time.sleep(0.2)
             return True
         except Exception as e:
-            print(f"发送 Enter 失败: {e}")
+            self.logger.error(f"发送 Enter 失败: {e}")
             return False
     
     def _char_to_vk(self, char: str) -> Optional[int]:
@@ -1157,7 +819,7 @@ class TongHuaShunExecutor:
                 
                 if vk_code is None:
                     # 如果无法转换为虚拟键码，尝试使用剪贴板方式
-                    print(f"警告: 字符 '{char}' 无法直接输入，尝试使用剪贴板方式")
+                    self.logger.warning(f"字符 '{char}' 无法直接输入，尝试使用剪贴板方式")
                     try:
                         win32clipboard.OpenClipboard()
                         win32clipboard.EmptyClipboard()
@@ -1172,7 +834,7 @@ class TongHuaShunExecutor:
                         time.sleep(0.05)
                         win32api.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)  # Ctrl up
                     except Exception as e:
-                        print(f"剪贴板输入也失败: {e}")
+                        self.logger.error(f"剪贴板输入也失败: {e}")
                         continue
                 else:
                     # 使用直接键盘输入（更可靠）
@@ -1207,9 +869,9 @@ class TongHuaShunExecutor:
             time.sleep(0.3)
             return True
         except Exception as e:
-            print(f"输入文本失败: {e}")
+            self.logger.error(f"输入文本失败: {e}")
             import traceback
-            traceback.print_exc()
+            self.logger.error(traceback.format_exc())
             return False
     
     def _get_stock_code(self, stock_input: str) -> str:
@@ -1231,24 +893,126 @@ class TongHuaShunExecutor:
             return self.stock_name_to_code[stock_input]
         
         # 如果找不到，返回原输入（可能是代码格式不同）
-        print(f"警告: 未找到股票 '{stock_input}' 的代码映射，使用原输入")
+        self.logger.warning(f"未找到股票 '{stock_input}' 的代码映射，使用原输入")
         return stock_input
     
+    def _get_price_decimal_places(self, price_str: str) -> int:
+        """
+        获取价格字符串的小数位数
+        
+        Args:
+            price_str: 价格字符串，如 "10.50" 或 "10.5" 或 "10.500"
+            
+        Returns:
+            小数位数，如果没有小数部分返回 0
+        """
+        if '.' not in price_str:
+            return 0
+        decimal_part = price_str.split('.')[1]
+        # 返回原始小数位数（包括末尾的0）
+        # 例如 "10.50" 返回 2，"10.5" 返回 1，"10.500" 返回 3
+        return len(decimal_part)
+    
+    def _calculate_market_price(self, base_price_str: str, is_buy: bool) -> str:
+        """
+        计算市价单价格（上下浮动1%）
+        
+        Args:
+            base_price_str: 基准价格字符串（如 "10.50"）
+            is_buy: True 为买入（比基准价高1%），False 为卖出（比基准价低1%）
+            
+        Returns:
+            格式化后的价格字符串，使用round对齐小数位
+        """
+        try:
+            base_price = float(base_price_str)
+        except ValueError:
+            self.logger.error(f"无法解析基准价格: {base_price_str}")
+            return base_price_str
+        
+        # 获取原始价格的小数位数
+        decimal_places = self._get_price_decimal_places(base_price_str)
+        
+        if is_buy:
+            # 买入：比基准价高1%
+            market_price = base_price * 1.01
+        else:
+            # 卖出：比基准价低1%
+            market_price = base_price * 0.99
+            # 确保价格不为负
+            if market_price < 0:
+                market_price = 0.01
+        
+        # 使用round对齐小数位
+        market_price = round(market_price, decimal_places)
+        
+        # 格式化为字符串，保持指定的小数位数
+        if decimal_places == 0:
+            return str(int(market_price))
+        else:
+            return f"{market_price:.{decimal_places}f}"
+    
+    def _is_trading_time(self) -> Tuple[bool, str]:
+        """
+        检查当前是否为交易时间（北京时间 9:25 - 15:00）
+        
+        Returns:
+            (是否在交易时间内, 提示信息)
+        """
+        # 获取北京时间
+        beijing_tz = timezone(timedelta(hours=8))
+        beijing_time = datetime.now(beijing_tz)
+        current_time = beijing_time.time()
+        current_weekday = beijing_time.weekday()  # 0=Monday, 6=Sunday
+        
+        # 检查是否为周末
+        if current_weekday >= 5:  # 周六或周日
+            return False, f"当前为周末（{beijing_time.strftime('%Y-%m-%d %H:%M:%S')}），不在交易时间内"
+        
+        # 交易时间：9:25 - 15:00
+        trading_start = dt_time(9, 25)
+        trading_end = dt_time(15, 0)
+        
+        if trading_start <= current_time <= trading_end:
+            return True, f"当前时间 {beijing_time.strftime('%Y-%m-%d %H:%M:%S')} 在交易时间内"
+        else:
+            if current_time < trading_start:
+                return False, f"当前时间 {beijing_time.strftime('%Y-%m-%d %H:%M:%S')} 早于交易时间（交易时间：9:25-15:00）"
+            else:
+                return False, f"当前时间 {beijing_time.strftime('%Y-%m-%d %H:%M:%S')} 晚于交易时间（交易时间：9:25-15:00）"
+    
+
+    # @FIX：新增了市价单模式，后期需要整合DataEngine进来
     def press_f1_buy(self, stock_code_or_name: Optional[str] = None, 
                      price: Optional[str] = None, 
-                     quantity: Optional[str] = None) -> bool:
+                     quantity: Optional[str] = None,
+                     price_mode: str = "limit") -> bool:
         """
         按 F1 键 - 买入
+        注意：只能在交易时间内执行（北京时间 9:25 - 15:00）
         
         Args:
             stock_code_or_name: 股票代码或名称（可选）
-            price: 价格（可选）
+            price: 价格（可选，限价模式下使用指定价格，市价模式下作为基准价格）
             quantity: 数量（可选）
+            price_mode: 价格模式，"limit" 为限价单（使用指定价格），"market" 为市价单（比基准价高1%）
         
         Returns:
             是否成功
         """
-        print("执行: F1 买入")
+        # 检查交易时间
+        is_trading, message = self._is_trading_time()
+        if not is_trading:
+            self.logger.error(f"买入操作失败: {message}")
+            return False
+        
+        self.logger.info(f"执行: F1 买入 (价格模式: {price_mode})")
+        
+        # DEBUG: 有时候多按了个enter之后，如果继续买入，光标会停留在第二第三行，从而逻辑错误，所以买卖切，自动回正。
+                    
+        # 1. 按 F2 键
+        if not self._send_key(0x71, wait_time=0.2):  # VK_F2
+            return False
         
         # 1. 按 F1 键
         if not self._send_key(0x70, wait_time=0.2):  # VK_F1
@@ -1259,7 +1023,7 @@ class TongHuaShunExecutor:
             return True
         
         # 2. 连续六次删除（清空输入框）
-        print("  清空输入框...")
+        self.logger.debug("  清空输入框...")
         if not self._send_backspace(times=6, wait_time=0.1):
             return False
         
@@ -1267,7 +1031,7 @@ class TongHuaShunExecutor:
         
         # 3. 输入股票代码（通过转换字典）
         stock_code = self._get_stock_code(stock_code_or_name)
-        print(f"  输入股票代码: {stock_code}")
+        self.logger.info(f"  输入股票代码: {stock_code}")
         if not self._send_text(stock_code, wait_time=0.15):
             return False
         time.sleep(0.2)  # 输入代码后等待
@@ -1275,10 +1039,21 @@ class TongHuaShunExecutor:
             return False
         time.sleep(0.3)  # Enter 后等待界面切换
         
-        # 4. 输入价格
-        if price:
-            print(f"  输入价格: {price}")
-            if not self._send_text(str(price), wait_time=0.15):
+        # 4. 处理价格（限价或市价）
+        final_price = None
+        if price_mode == "market" and price:
+            # 市价单：计算买入价格（比基准价高1%）
+            final_price = self._calculate_market_price(price, is_buy=True)
+            self.logger.info(f"  市价单：基准价格 {price}，买入价格 {final_price}")
+        elif price:
+            # 限价单：使用指定价格
+            final_price = price
+            self.logger.info(f"  限价单：使用指定价格 {final_price}")
+        
+        # 5. 输入价格
+        if final_price:
+            self.logger.info(f"  输入价格: {final_price}")
+            if not self._send_text(str(final_price), wait_time=0.15):
                 return False
             time.sleep(0.2)  # 输入价格后等待
             if not self._send_enter(times=1, wait_time=0.2):
@@ -1289,9 +1064,9 @@ class TongHuaShunExecutor:
             self._send_enter(times=1, wait_time=0.2)
             time.sleep(0.3)
         
-        # 5. 输入数量
+        # 6. 输入数量
         if quantity:
-            print(f"  输入数量: {quantity}")
+            self.logger.info(f"  输入数量: {quantity}")
             if not self._send_text(str(quantity), wait_time=0.15):
                 return False
             time.sleep(0.2)  # 输入数量后等待
@@ -1303,31 +1078,44 @@ class TongHuaShunExecutor:
             self._send_enter(times=1, wait_time=0.2)
             time.sleep(0.3)
         
-        # 6. 全部输入完毕后连续两次 Enter（确认买入）
-        print("  确认买入...")
+        # 7. 全部输入完毕后连续两次 Enter（确认买入）
+        self.logger.info("  确认买入...")
         time.sleep(0.2)  # 确认前等待
         if not self._send_enter(times=2, wait_time=0.25):
             return False
         
-        print("买入操作完成")
+        self.logger.info("买入操作完成")
         return True
     
     def press_f2_sell(self, stock_code_or_name: Optional[str] = None, 
                      price: Optional[str] = None, 
-                     quantity: Optional[str] = None) -> bool:
+                     quantity: Optional[str] = None,
+                     price_mode: str = "limit") -> bool:
         """
         按 F2 键 - 卖出
+        注意：只能在交易时间内执行（北京时间 9:25 - 15:00）
         
         Args:
             stock_code_or_name: 股票代码或名称（可选）
-            price: 价格（可选）
+            price: 价格（可选，限价模式下使用指定价格，市价模式下作为基准价格）
             quantity: 数量（可选）
+            price_mode: 价格模式，"limit" 为限价单（使用指定价格），"market" 为市价单（比基准价低1%）
         
         Returns:
             是否成功
         """
-        print("执行: F2 卖出")
+        # 检查交易时间
+        is_trading, message = self._is_trading_time()
+        if not is_trading:
+            self.logger.error(f"卖出操作失败: {message}")
+            return False
         
+        self.logger.info(f"执行: F2 卖出 (价格模式: {price_mode})")
+        
+                # 1. 按 F1 键
+        if not self._send_key(0x70, wait_time=0.2):  # VK_F1
+            return False
+
         # 1. 按 F2 键
         if not self._send_key(0x71, wait_time=0.2):  # VK_F2
             return False
@@ -1337,7 +1125,7 @@ class TongHuaShunExecutor:
             return True
         
         # 2. 连续六次删除（清空输入框）
-        print("  清空输入框...")
+        self.logger.debug("  清空输入框...")
         if not self._send_backspace(times=6, wait_time=0.1):
             return False
         
@@ -1345,7 +1133,7 @@ class TongHuaShunExecutor:
         
         # 3. 输入股票代码（通过转换字典）
         stock_code = self._get_stock_code(stock_code_or_name)
-        print(f"  输入股票代码: {stock_code}")
+        self.logger.info(f"  输入股票代码: {stock_code}")
         if not self._send_text(stock_code, wait_time=0.15):
             return False
         time.sleep(0.2)  # 输入代码后等待
@@ -1353,13 +1141,24 @@ class TongHuaShunExecutor:
             return False
         time.sleep(0.3)  # Enter 后等待界面切换
         
-        # 4. 输入价格
-        if price:
-            print(f"  输入价格: {price}")
-            if not self._send_text(str(price), wait_time=0.15):
+        # 4. 处理价格（限价或市价）
+        final_price = None
+        if price_mode == "market" and price:
+            # 市价单：计算卖出价格（比基准价低1%）
+            final_price = self._calculate_market_price(price, is_buy=False)
+            self.logger.info(f"  市价单：基准价格 {price}，卖出价格 {final_price}")
+        elif price:
+            # 限价单：使用指定价格
+            final_price = price
+            self.logger.info(f"  限价单：使用指定价格 {final_price}")
+        
+        # 5. 输入价格
+        if final_price:
+            self.logger.info(f"  输入价格: {final_price}")
+            if not self._send_text(str(final_price), wait_time=0.4):
                 return False
             time.sleep(0.2)  # 输入价格后等待
-            if not self._send_enter(times=1, wait_time=0.2):
+            if not self._send_enter(times=1, wait_time=0.4):
                 return False
             time.sleep(0.3)  # Enter 后等待界面切换
         else:
@@ -1367,9 +1166,9 @@ class TongHuaShunExecutor:
             self._send_enter(times=1, wait_time=0.2)
             time.sleep(0.3)
         
-        # 5. 输入数量
+        # 6. 输入数量
         if quantity:
-            print(f"  输入数量: {quantity}")
+            self.logger.info(f"  输入数量: {quantity}")
             if not self._send_text(str(quantity), wait_time=0.15):
                 return False
             time.sleep(0.2)  # 输入数量后等待
@@ -1381,13 +1180,14 @@ class TongHuaShunExecutor:
             self._send_enter(times=1, wait_time=0.2)
             time.sleep(0.3)
         
-        # 6. 全部输入完毕后连续两次 Enter（确认卖出）
-        print("  确认卖出...")
-        time.sleep(0.2)  # 确认前等待
-        if not self._send_enter(times=2, wait_time=0.25):
+        # DEBUG: 有时候卖出之后会卡在确认委托那里，到交易设置里面去取消掉那些确认、或者委托提示之类的东西！
+        # 7. 全部输入完毕后连续两次 Enter（确认卖出）
+        self.logger.info("  确认卖出...")
+        time.sleep(1)  # 确认前等待
+        if not self._send_enter(times=2, wait_time=0.3):
             return False
         
-        print("卖出操作完成")
+        self.logger.info("卖出操作完成")
         return True
     
     def press_f3_cancel(self) -> bool:
@@ -1397,7 +1197,7 @@ class TongHuaShunExecutor:
         Returns:
             是否成功
         """
-        print("执行: F3 撤单")
+        self.logger.info("执行: F3 撤单")
         result = self._send_key(0x72, wait_time=0.2)  # VK_F3
         # TODO: 后续补充撤单操作逻辑
         return result
@@ -1431,7 +1231,7 @@ class TongHuaShunExecutor:
                 ]
             }
         """
-        print("执行: F4 查询资产")
+        self.logger.info("执行: F4 查询资产")
         
         # 1. 按 F4 键进入资产页面
         if not self._send_key(0x73, wait_time=0.5):  # VK_F4，等待时间稍长确保页面加载
@@ -1441,19 +1241,18 @@ class TongHuaShunExecutor:
         time.sleep(1.0)
         
         # 3. 截图
-        print("  正在截图...")
+        self.logger.info("  正在截图...")
         screenshot = self.capture_window()
         if not screenshot:
-            print("  截图失败")
+            self.logger.error("  截图失败")
             return None
         
         # 获取截图路径（capture_window 会保存截图）
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        screenshot_path = os.path.join(self.screenshot_dir, f"screenshot_{timestamp}.png")
+        screenshot_path = self.logger.get_screenshot_path()
         
         # 4. 使用 VLM 分析截图
         if use_vlm and self.vlm_analyzer:
-            print("  正在使用 VLM 分析资产数据...")
+            self.logger.info("  正在使用 VLM 分析资产数据...")
             try:
                 # 设计 prompt 来提取资产数据
                 prompt = """请仔细分析这张股票交易软件的资产查询页面截图，提取所有资产相关信息。
@@ -1487,7 +1286,7 @@ class TongHuaShunExecutor:
                     prompt=prompt
                 )
                 
-                print("  VLM 分析完成")
+                self.logger.info("  VLM 分析完成")
                 
                 # 尝试解析和格式化返回结果
                 if isinstance(result, dict):
@@ -1498,18 +1297,18 @@ class TongHuaShunExecutor:
                     try:
                         return json.loads(result)
                     except json.JSONDecodeError:
-                        print(f"  警告: VLM 返回的不是有效 JSON: {result}")
+                        self.logger.warning(f"  VLM 返回的不是有效 JSON: {result}")
                         return {"raw_result": result}
                 else:
                     return {"result": result}
                     
             except Exception as e:
-                print(f"  VLM 分析失败: {e}")
+                self.logger.error(f"  VLM 分析失败: {e}")
                 import traceback
-                traceback.print_exc()
+                self.logger.error(traceback.format_exc())
                 return None
         else:
-            print("  未使用 VLM 分析（VLM 不可用或已禁用）")
+            self.logger.warning("  未使用 VLM 分析（VLM 不可用或已禁用）")
             return None
     
     def press_f6_position(self) -> bool:
@@ -1520,7 +1319,7 @@ class TongHuaShunExecutor:
         Returns:
             是否成功
         """
-        print("执行: F1 -> F6 持仓")
+        self.logger.info("执行: F1 -> F6 持仓")
         # 先按 F1 进入买入界面
         if not self.press_f1_buy():
             return False
@@ -1538,7 +1337,7 @@ class TongHuaShunExecutor:
         Returns:
             是否成功
         """
-        print("执行: F1 -> F7 成交单")
+        self.logger.info("执行: F1 -> F7 成交单")
         # 先按 F1 进入买入界面
         if not self.press_f1_buy():
             return False
@@ -1556,7 +1355,7 @@ class TongHuaShunExecutor:
         Returns:
             是否成功
         """
-        print("执行: F1 -> F8 委托单")
+        self.logger.info("执行: F1 -> F8 委托单")
         # 先按 F1 进入买入界面
         if not self.press_f1_buy():
             return False
@@ -1688,10 +1487,7 @@ def test_f4_query(executor: TongHuaShunExecutor):
         
         # 保存结果到 JSON 文件
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            result_file = os.path.join(executor.screenshot_dir, f"asset_data_{timestamp}.json")
-            with open(result_file, 'w', encoding='utf-8') as f:
-                json.dump(asset_data, f, ensure_ascii=False, indent=2)
+            result_file = executor.logger.save_asset_data(asset_data)
             print(f"\n✓ 资产数据已保存到: {result_file}")
         except Exception as e:
             print(f"\n✗ 保存资产数据失败: {e}")
