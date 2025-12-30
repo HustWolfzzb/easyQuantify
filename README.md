@@ -54,7 +54,8 @@ EasyQuantify 是一个面向A股市场的量化交易系统，集成了数据获
 - **Neo4j**：知识图谱存储
 
 ### 交易层
-- **easytrader**：自动化交易接口
+- **TongHuaShunExecutor**：同花顺下单程序执行器，基于Windows窗口操作和图像识别实现自动化交易
+- **easytrader**：自动化交易接口（传统方式）
 - **easyquotation**：实时行情获取
 
 ### 算法层
@@ -100,7 +101,8 @@ easyQuantify/
 │   ├── simple.py          # 简单情绪分析
 │   └── News/              # 新闻获取
 ├── Trade/                 # 交易执行
-│   ├── Operation.py       # 交易操作
+│   ├── TongHuaShunExecutor.py  # 同花顺自动化交易执行器
+│   ├── Operation.py       # 交易操作（easytrader接口）
 │   └── Entity.py          # 交易实体
 ├── RiskControl/           # 风险控制
 │   └── RiskControl.py     # 风控模块
@@ -292,7 +294,30 @@ pip install -r requirements.txt
 
 ### 6. 交易执行 (Trade)
 
-#### 自动化交易
+#### 同花顺自动化交易执行器 ⭐
+- **功能**：基于Windows窗口操作和图像识别实现同花顺下单程序的自动化交易
+- **文件**：`Trade/TongHuaShunExecutor.py`
+- **核心特性**：
+  - **自动化下单**：支持买入（F1）、卖出（F2）、撤单（F3）等操作
+  - **订单模式**：支持限价单和市价单模式
+    - 限价单：使用指定价格下单
+    - 市价单：自动计算价格（买入比基准价高1%，卖出比基准价低1%），保持小数位数一致
+  - **资产查询**：通过F4键查询资产，支持VLM图像分析自动提取资产数据
+  - **持仓管理**：支持查询持仓（F6）、成交单（F7）、委托单（F8）
+  - **交易时间检查**：自动检查交易时间（9:25-15:00），非交易时间拒绝执行
+  - **日志系统**：完整的日志记录和文件管理
+    - 自动保存截图到 `SystemLog/screenshots/`
+    - 自动保存资产数据到 `SystemLog/assets/`
+    - 日志文件保存到 `SystemLog/logs/`
+    - 自动清理超过7天的过期文件
+  - **窗口管理**：自动查找、聚焦和操作同花顺交易窗口
+  - **VLM集成**：可选集成视觉语言模型进行图像分析
+- **依赖**：
+  - **pywin32**：Windows API操作
+  - **PIL/Pillow**：图像处理
+  - **VLMImageAnalyzer**（可选）：视觉语言模型分析
+
+#### 传统自动化交易接口
 - **功能**：集成easytrader和easyquotation实现自动化交易
 - **文件**：`Trade/Operation.py`, `Trade/Entity.py`
 - **依赖**：
@@ -325,13 +350,37 @@ pip install -r requirements.txt
 000002:1.02
 ```
 
-### 运行主程序
+### 同花顺自动化交易示例
 
-```bash
-python main.py
+```python
+from Trade.TongHuaShunExecutor import TongHuaShunExecutor
+
+# 初始化执行器
+exe_path = r"D:\Program Files (x86)\ths\同花顺\xiadan.exe"
+executor = TongHuaShunExecutor(exe_path)
+
+# 启动或激活程序
+if executor.launch_program() or executor.activate_window():
+    # 限价买入
+    executor.press_f1_buy(
+        stock_code_or_name="000001",
+        price="10.50",
+        quantity="100",
+        price_mode="limit"
+    )
+    
+    # 市价买入（比基准价高1%）
+    executor.press_f1_buy(
+        stock_code_or_name="000001",
+        price="10.50",  # 基准价格
+        quantity="100",
+        price_mode="market"  # 自动计算为 10.605
+    )
+    
+    # 查询资产（使用VLM分析）
+    asset_data = executor.press_f4_query(use_vlm=True)
+    print(asset_data)
 ```
-
----
 
 ## ⚠️ 风险提示
 
