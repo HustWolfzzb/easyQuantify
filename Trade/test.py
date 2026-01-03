@@ -18,19 +18,20 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from Trade.TongHuaShunExecutor import TongHuaShunExecutor
+from DataEngine.Data import DataEngine
 
-# 目标 ETF 列表
+# 目标 ETF 列表（不再需要 price 字段，将实时获取）
 target_etfs = [
-    {'name': '通信ETF', 'code': '159695', 'price': 2.247},
-    {'name': '电池ETF', 'code': '159755', 'price': 1.059},
-    {'name': '港股创新药ETF', 'code': '159567', 'price': 0.784},
-    {'name': '机器人ETF', 'code': '159770', 'price': 1.018},
-    {'name': '有色ETF', 'code': '512400', 'price': 1.847},
-    {'name': '恒生科技指数ETF', 'code': '159742', 'price': 0.740},
-    {'name': '创业板50ETF', 'code': '159949', 'price': 1.542},
-    {'name': '光伏ETF', 'code': '515790', 'price': 0.970},
-    {'name': '人工智能ETF', 'code': '159819', 'price': 1.527},
-    {'name': '中韩芯片', 'code': '513310', 'price': 2.512}
+    {'name': '通信ETF', 'code': '159695'},
+    {'name': '电池ETF', 'code': '159755'},
+    {'name': '港股创新药ETF', 'code': '159567'},
+    {'name': '机器人ETF', 'code': '159770'},
+    {'name': '有色ETF', 'code': '512400'},
+    {'name': '恒生科技指数ETF', 'code': '159742'},
+    {'name': '创业板50ETF', 'code': '159949'},
+    {'name': '光伏ETF', 'code': '515790'},
+    {'name': '人工智能ETF', 'code': '159819'},
+    {'name': '中韩芯片', 'code': '513310'}
 ]
 
 
@@ -82,12 +83,13 @@ def parse_int(value: Any) -> int:
     return 0
 
 
-def get_current_position(executor: TongHuaShunExecutor) -> Tuple[float, List[Dict[str, Any]]]:
+def get_current_position(executor: TongHuaShunExecutor, data_engine: DataEngine) -> Tuple[float, List[Dict[str, Any]]]:
     """
-    获取当前可用余额和持仓列表
+    获取当前可用余额和持仓列表（使用实时价格接口）
     
     Args:
         executor: TongHuaShunExecutor 实例
+        data_engine: DataEngine 实例，用于获取实时价格
         
     Returns:
         (可用余额, 持仓列表)
@@ -113,13 +115,40 @@ def get_current_position(executor: TongHuaShunExecutor) -> Tuple[float, List[Dic
     
     if stocks:
         print(f"\n✓ 当前持仓 (共 {len(stocks)} 只):")
+        
+        # 批量获取所有持仓的实时价格
+        codes = []
+        for stock in stocks:
+            code = stock.get('code', '')
+            # 提取6位代码（去掉可能的后缀）
+            code_6digit = code[:6] if len(code) >= 6 else code
+            if code_6digit and code_6digit not in codes:
+                codes.append(code_6digit)
+        
+        # 批量获取实时价格
+        realtime_prices = {}
+        if codes:
+            try:
+                realtime_data = data_engine.realTimePrice(codes)
+                for code_6digit, price_info in realtime_data.items():
+                    if price_info and 'now' in price_info:
+                        realtime_prices[code_6digit] = parse_float(price_info.get('now', 0))
+            except Exception as e:
+                print(f"  ⚠ 获取实时价格失败: {str(e)}")
+        
+        # 处理每个持仓
         for stock in stocks:
             code = stock.get('code', '')
             name = stock.get('name', '')
             quantity = parse_int(stock.get('quantity', 0))
-            current_price = parse_float(stock.get('current_price', 0))
+            
+            # 提取6位代码用于查询实时价格
+            code_6digit = code[:6] if len(code) >= 6 else code
             
             if code and quantity > 0:
+                # 从实时价格接口获取当前价
+                current_price = realtime_prices.get(code_6digit, 0)
+                
                 positions.append({
                     'code': code,
                     'name': name,
@@ -127,22 +156,24 @@ def get_current_position(executor: TongHuaShunExecutor) -> Tuple[float, List[Dic
                     'current_price': current_price
                 })
                 if current_price > 0:
-                    print(f"  - {name} ({code}): {quantity} 股, 当前价: {current_price:.3f} 元")
+                    print(f"  - {name} ({code}): {quantity} 股, 实时价: {current_price:.3f} 元")
                 else:
-                    print(f"  - {name} ({code}): {quantity} 股")
+                    print(f"  - {name} ({code}): {quantity} 股 (无法获取实时价格)")
     else:
         print("\n✓ 当前无持仓")
     
     return available_cash, positions
 
 
-def sell_all_positions(executor: TongHuaShunExecutor, positions: List[Dict[str, Any]]) -> bool:
+def sell_all_positions(executor: TongHuaShunExecutor, positions: List[Dict[str, Any]], 
+                      data_engine: DataEngine) -> bool:
     """
-    市价卖出所有持仓（使用 price_mode="market"，比当前价低1%）
+    市价卖出所有持仓（使用 price_mode="market"，比当前价低1%，实时获取价格）
     
     Args:
         executor: TongHuaShunExecutor 实例
-        positions: 持仓列表，每个持仓包含 'code', 'name', 'quantity', 'current_price'
+        positions: 持仓列表，每个持仓包含 'code', 'name', 'quantity'
+        data_engine: DataEngine 实例，用于获取实时价格
         
     Returns:
         是否全部卖出成功
@@ -155,7 +186,7 @@ def sell_all_positions(executor: TongHuaShunExecutor, positions: List[Dict[str, 
         return True
     
     print("\n" + "="*60)
-    print("步骤2: 市价卖出所有持仓（使用市价单，比当前价低1%）")
+    print("步骤2: 市价卖出所有持仓（使用市价单，比实时价低1%）")
     print("="*60)
     
     success_count = 0
@@ -163,12 +194,25 @@ def sell_all_positions(executor: TongHuaShunExecutor, positions: List[Dict[str, 
         code = pos['code']
         name = pos['name']
         quantity = pos['quantity']
-        current_price = pos.get('current_price', 0)
+        
+        # 提取6位代码用于查询实时价格
+        code_6digit = code[:6] if len(code) >= 6 else code
+        
+        # 实时获取当前价格
+        try:
+            realtime_data = data_engine.realTimePrice(code_6digit)
+            if code_6digit in realtime_data and realtime_data[code_6digit]:
+                current_price = parse_float(realtime_data[code_6digit].get('now', 0))
+            else:
+                current_price = 0
+        except Exception as e:
+            print(f"  ⚠ 获取 {name} ({code}) 实时价格失败: {str(e)}")
+            current_price = 0
         
         if current_price > 0:
             print(f"\n[{i}/{len(positions)}] 卖出: {name} ({code})")
-            print(f"  当前价: {current_price:.3f} 元, 数量: {quantity} 股")
-            print(f"  使用市价单（比当前价低1%）")
+            print(f"  实时价: {current_price:.3f} 元, 数量: {quantity} 股")
+            print(f"  使用市价单（比实时价低1%）")
             
             # 市价卖出：使用 price_mode="market"，传入当前价作为基准价格
             # 函数内部会自动计算比基准价低1%的价格
@@ -184,7 +228,7 @@ def sell_all_positions(executor: TongHuaShunExecutor, positions: List[Dict[str, 
                 print(f"  ✗ 卖出失败")
         else:
             print(f"\n[{i}/{len(positions)}] 卖出: {name} ({code}), 数量: {quantity} 股")
-            print(f"  警告: 无法获取当前价，跳过该股票")
+            print(f"  警告: 无法获取实时价格，跳过该股票")
         
         # 每次卖出后等待，避免操作过快
         time.sleep(1.0)
@@ -200,28 +244,66 @@ def sell_all_positions(executor: TongHuaShunExecutor, positions: List[Dict[str, 
 
 
 def buy_etfs_by_price(executor: TongHuaShunExecutor, etf_list: List[Dict[str, Any]], 
-                      available_cash: float) -> bool:
+                      available_cash: float, data_engine: DataEngine) -> bool:
     """
-    按照价格从低到高买入 ETF 列表，每个ETF买一手（100股），直到资金用尽（使用 price_mode="market"，比参考价高1%）
+    按照价格从低到高买入 ETF 列表，每个ETF买一手（100股），直到资金用尽（使用 price_mode="market"，比实时价高1%）
     
     Args:
         executor: TongHuaShunExecutor 实例
-        etf_list: ETF 列表，每个元素包含 'name', 'code', 'price'（参考价格）
+        etf_list: ETF 列表，每个元素包含 'name', 'code'
         available_cash: 可用资金
+        data_engine: DataEngine 实例，用于获取实时价格
         
     Returns:
         是否成功执行买入操作
     """
     print("\n" + "="*60)
-    print("步骤3: 按价格从低到高买入 ETF（每个ETF买一手，使用市价单，比参考价高1%）")
+    print("步骤3: 按价格从低到高买入 ETF（每个ETF买一手，使用市价单，比实时价高1%）")
     print("="*60)
     
-    # 按价格从低到高排序
-    sorted_etfs = sorted(etf_list, key=lambda x: x['price'])
+    # 批量获取所有ETF的实时价格
+    codes = [etf['code'] for etf in etf_list]
+    realtime_prices = {}
     
-    print(f"\nETF 列表（按价格从低到高）:")
+    print("\n正在获取ETF实时价格...")
+    try:
+        realtime_data = data_engine.realTimePrice(codes)
+        for code, price_info in realtime_data.items():
+            if price_info and 'now' in price_info:
+                realtime_prices[code] = parse_float(price_info.get('now', 0))
+    except Exception as e:
+        print(f"  ⚠ 批量获取实时价格失败: {str(e)}")
+        print("  将逐个获取价格...")
+    
+    # 为每个ETF添加实时价格，并过滤掉无法获取价格的ETF
+    etfs_with_price = []
+    for etf in etf_list:
+        code = etf['code']
+        if code in realtime_prices and realtime_prices[code] > 0:
+            etf['price'] = realtime_prices[code]
+            etfs_with_price.append(etf)
+        else:
+            # 如果批量获取失败，尝试单独获取
+            try:
+                single_data = data_engine.realTimePrice(code)
+                if code in single_data and single_data[code]:
+                    price = parse_float(single_data[code].get('now', 0))
+                    if price > 0:
+                        etf['price'] = price
+                        etfs_with_price.append(etf)
+            except Exception as e:
+                print(f"  ⚠ 无法获取 {etf['name']} ({code}) 的实时价格: {str(e)}")
+    
+    if not etfs_with_price:
+        print("❌ 无法获取任何ETF的实时价格，无法执行买入操作")
+        return False
+    
+    # 按价格从低到高排序
+    sorted_etfs = sorted(etfs_with_price, key=lambda x: x['price'])
+    
+    print(f"\nETF 列表（按实时价格从低到高）:")
     for i, etf in enumerate(sorted_etfs, 1):
-        print(f"  {i}. {etf['name']} ({etf['code']}): 参考价 {etf['price']:.3f} 元")
+        print(f"  {i}. {etf['name']} ({etf['code']}): 实时价 {etf['price']:.3f} 元")
     
     print(f"\n可用资金: {available_cash:.2f} 元")
     print("\n开始买入...")
@@ -232,14 +314,14 @@ def buy_etfs_by_price(executor: TongHuaShunExecutor, etf_list: List[Dict[str, An
     for i, etf in enumerate(sorted_etfs, 1):
         code = etf['code']
         name = etf['name']
-        reference_price = etf['price']  # 参考价格
+        current_price = etf['price']  # 实时价格
         
         # 每个ETF只买一手（100股）
         shares_per_etf = 100
         
-        # 计算市价买入价格：参考价 * 1.01（比参考价高1%，用于计算所需资金）
+        # 计算市价买入价格：实时价 * 1.01（比实时价高1%，用于计算所需资金）
         # 注意：实际买入价格会在 press_f1_buy 中自动计算
-        estimated_buy_price = reference_price * 1.01
+        estimated_buy_price = current_price * 1.01
         required_cash = estimated_buy_price * shares_per_etf
         
         # 检查资金是否足够买入一手
@@ -248,14 +330,14 @@ def buy_etfs_by_price(executor: TongHuaShunExecutor, etf_list: List[Dict[str, An
             break
         
         print(f"\n[{i}/{len(sorted_etfs)}] 买入: {name} ({code})")
-        print(f"  参考价: {reference_price:.3f} 元, 数量: {shares_per_etf} 股（一手）")
-        print(f"  使用市价单（比参考价高1%），预计金额: {required_cash:.2f} 元")
+        print(f"  实时价: {current_price:.3f} 元, 数量: {shares_per_etf} 股（一手）")
+        print(f"  使用市价单（比实时价高1%），预计金额: {required_cash:.2f} 元")
         
-        # 市价买入：使用 price_mode="market"，传入参考价作为基准价格
+        # 市价买入：使用 price_mode="market"，传入实时价作为基准价格
         # 函数内部会自动计算比基准价高1%的价格
         if executor.press_f1_buy(
             stock_code_or_name=code,
-            price=str(reference_price),  # 基准价格
+            price=str(current_price),  # 基准价格（实时价）
             quantity=str(shares_per_etf),  # 固定100股
             price_mode="market"  # 市价单模式
         ):
@@ -283,6 +365,14 @@ def main():
     print("ETF 重新平衡程序")
     print("="*60)
     
+    # 创建数据引擎实例（用于获取实时价格）
+    try:
+        data_engine = DataEngine()
+        print("✓ 数据引擎初始化成功")
+    except Exception as e:
+        print(f"❌ 数据引擎初始化失败: {e}")
+        return
+    
     # 配置同花顺程序路径（请根据实际情况修改）
     exe_path = r"D:\Program Files (x86)\ths\同花顺\xiadan.exe"
     
@@ -304,28 +394,28 @@ def main():
     
     try:
         # # 步骤1: 获取当前可用余额和持仓
-        # available_cash, positions = get_current_position(executor)
+        # available_cash, positions = get_current_position(executor, data_engine)
         
         # if available_cash <= 0 and not positions:
         #     print("\n❌ 无可用资金且无持仓，无法执行操作")
         #     return
         
-        # # 步骤2: 市价卖出所有持仓
-        # sell_all_positions(executor, positions)
+        # # 步骤2: 市价卖出所有持仓（使用实时价格）
+        # sell_all_positions(executor, positions, data_engine)
         
         # # 等待卖出完成，然后重新查询可用余额
         # print("\n等待卖出完成并重新查询可用余额...")
         # time.sleep(5.0)
         
         # 重新查询可用余额（卖出后资金会增加）
-        available_cash, _ = get_current_position(executor)
+        available_cash, _ = get_current_position(executor, data_engine)
         
         if available_cash <= 0:
             print("\n❌ 可用资金不足，无法买入 ETF")
             return
         
-        # 步骤3: 按照价格从低到高买入 ETF
-        buy_etfs_by_price(executor, target_etfs, available_cash)
+        # 步骤3: 按照价格从低到高买入 ETF（使用实时价格）
+        buy_etfs_by_price(executor, target_etfs, available_cash, data_engine)
         
         print("\n" + "="*60)
         print("✓ ETF 重新平衡完成")
