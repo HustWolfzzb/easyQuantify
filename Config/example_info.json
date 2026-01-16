@@ -1,0 +1,40 @@
+{
+  "百度文字识别": {
+    "APP_ID": "your_app_id",
+    "API_KEY": "your_api_key",
+    "SECRECT_KEY": "your_secret_key"
+  },
+  "Tushare": {
+    "api": "your_tushare_token"
+  },
+  "Mysql": {
+    "user": "your_mysql_user",
+    "password": "your_mysql_password",
+    "host": "your_mysql_host",
+    "host1": "127.0.0.1",
+    "port": 3306,
+    "db": "your_database_name",
+    "charset": "utf8"
+  },
+  "Neo4j": {
+    "name": "neo4j",
+    "password": "your_neo4j_password",
+    "url1": "bolt://localhost:7687",
+    "url2": "bolt://your_neo4j_host:7687"
+  },
+  "Mongo": {
+    "user": "your_mongo_user",
+    "password": "your_mongo_password",
+    "host": "your_mongo_host",
+    "host1": "127.0.0.1",
+    "port": 27017,
+    "db": "your_database_name",
+    "charset": "utf8"
+  },
+  "DashScope": {
+    "api_key": "sk-your_dashscope_api_key",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen3-vl-plus"
+  }
+}
+
